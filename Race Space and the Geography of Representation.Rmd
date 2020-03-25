@@ -1,0 +1,500 @@
+---
+title: "Race Space and the Geography of Representation"
+author: "Christopher S. Fowler"
+date: "3/24/20"
+output: html_document
+---
+This document provides the replication materials for Figures and values cited in the book chapter "Race Space and the Geography of Representation" by Christopher S. Fowler in the book __________. The code provided here is itself excerpted from supporting materials for a paper entitled "Seeking Representation in the Districting Process: A proposal for six three-member Congressional districts to represent Pennsylvania." That paper is available in pre-print form at: ______________________
+
+The script that follows relies on both R and Python and may pose some challenges to replication as a result. The R portion of the script will run smoothly in RStudio running R version 3.6.0 (2019-04-26). The python portion of the script requires that the user create a 'conda environment' called 'gerry' by following the instructions at https://gerrychain.readthedocs.io/en/latest/ 
+
+Setup section. Establishes pathnames and key variables for defining ensemble of plans. 
+```{r setup, include=FALSE}
+library(tidyverse)
+library(tidycensus)
+library(reticulate)
+library(sf)
+#library(tmaptools)
+library(reshape2)
+library(ggpubr)
+
+#library(scales)
+#library(stringi)
+library(RColorBrewer)
+#library(ggrepel)
+
+#tidycensus works with an api from the census you will need to apply for your own api key to run this script
+#http://api.census.gov/data/key_signup.html
+census_api_key("your_api_here",install=TRUE)
+
+#R Global variable set
+overwrite = TRUE #meant to save time by using files already in the project directory if they exist. Can be set to TRUE to recreate all files from scratch
+
+options(tigris_use_cache = TRUE) #This prevents tidycensus from downloading the same shapefiles from census multiple times
+
+#Python variables set
+shpPath<-paste0(getwd(),"/PA_Tracts/PA_Tracts.shp") 
+jsonPath<-paste0(getwd(),"/PA_Tracts/PA_Tracts.json")
+
+numDist = 18  #how many districts should be in the plan
+totSteps = 10 #number of steps in the gerry chain. 10 is ideal for testing 10k-30k for full eval
+
+#py_discover_config() #identify the available conda environments
+use_condaenv(condaenv='gerry', required = TRUE) #this is set up based on the instructions for installing gerryChain using conda. See online docs for gerryChain
+
+#Special R functions
+#Custom function to return MSD on the metrics we have for a *single* district's data
+#this is the numerator for the MSD value, not the entire value
+getMSD<-function(data,target){
+    return(((sum(data[,2],na.rm=TRUE)/sum(data[,1],na.rm=TRUE))-target)^2)
+}
+#Return just the difference from the state average
+getDiff<-function(data,target){
+    return((sum(data[,2],na.rm=TRUE)/sum(data[,1],na.rm=TRUE))-target)
+}
+#The function that calculates how different random plans performed on 
+#a given metric --returns the plan's average district difference from the state as well as the maximum district difference from the commonwealth
+generate_metrics<-function(metrics,metric_vals,result,numDist=numDist,tracts=tracts){
+  output_metrics<-data.frame(Plan=1:(length(colnames(result))-1),matrix(nrow = length(colnames(result))-1,ncol=length(metrics)))
+  output_metrics_max<-data.frame(Plan=1:(length(colnames(result))-1),matrix(nrow = length(colnames(result))-1,ncol=length(metrics)))
+  num_districts<-numDist
+  colnames(output_metrics)<-c("Plan",metrics)
+  colnames(output_metrics_max)<-c("Plan",metrics)
+  output_metrics$VRA<-NA
+  temp<-tracts
+  temp$geometry<-NULL
+  result$GEOID<-NULL
+  suppressWarnings(if(class(result)=="sf"){
+    result<-st_drop_geometry(result)
+  })
+  #For each metric we calculate the total squared difference from the statewide target for each district
+  for(i in 1:(length(colnames(result)))){ #for each plan
+    temp$District<-result[,i]
+    temp_sub<-temp[,c("TOTALPOP","Black","District")]
+    district_pcts<-sapply(X=1:num_districts,FUN=function(x) getDiff(data=temp_sub[temp_sub$District==x,],target=0))
+    output_metrics[i,"VRA"]<-length(district_pcts[district_pcts>.25])
+    for(j in 1:length(metrics)){ #for each metric
+      if(metrics[j]=="PctBlack"){
+        temp_sub<-temp[,c("TOTALPOP","Black","District")]
+      }else if(metrics[j]=="PctUrban"){
+        temp_sub<-temp[,c("TOTALPOP","UrbanPop","District")]
+      }else if(metrics[j]=="PctPoverty"){
+        temp_sub<-temp[,c("PovDeterm","InPoverty","District")]
+      }else if(metrics[j]=="Pct65Plus"){
+        temp_sub<-temp[,c("TOTALPOP","Pop65Plus","District")]
+      }else if(metrics[j]=="PctHasHealthIns"){
+        temp_sub<-temp[,c("HealthInsD","HasHealthI","District")]
+      }else if(metrics[j]=="PctHHwChild"){
+        temp_sub<-temp[,c("Households","HHwChild","District")]
+      }else if(metrics[j]=="PctManufacturing"){
+        temp_sub<-temp[,c("EmployedTot","EmpManufac","District")]
+      }else if(metrics[j]=="ShareDem"){
+        temp_sub<-temp[,c("VotersT16","T16SEND","District")]
+      }
+    output_metrics[i,j+1]<-sqrt(sum(sapply(X=1:num_districts,FUN=function(x)  getMSD(data=temp_sub[temp_sub$District==x,],target=metric_vals[j])))/num_districts)
+
+    output_metrics_max[i,j+1]<-max(sapply(X=1:num_districts,FUN=function(x)  getDiff(data=temp_sub[temp_sub$District==x,],target=metric_vals[j])))
+    }
+  }
+  return(list(output_metrics,output_metrics_max))
+}
+```
+Data download and pre-processing. In this section we select the variables for download from Census including both decenniel and ACS. Note that, by convention, variables to be sent to python for use in the ensemble are in ALLCAPS while variables retained just for analysis in R are in FirstLetter form. This section can be modified to increase or decrease the number of variables being considered. At present it collects: Total Population, Black Population, Voting Age Population, Black Voting Age Population as well as data on urban/rural, poverty, health insurance, manufacturing employment, and senior citizens.
+```{r getCensusData, echo=FALSE}
+if(!file.exists("PA_Tracts/PA_Tracts.shp") | overwrite==TRUE){
+#Retained for convenience. This text offers an example of how to select variables from Census API
+#Examine variables in decennial census
+#vars <- load_variables(year = 2010, dataset = "sf1", cache = TRUE)
+#unique(vars$concept)
+#inds<-vars[vars$concept=="SEX BY INDUSTRY FOR THE CIVILIAN EMPLOYED POPULATION 16 YEARS AND OVER",]
+#inds %>% print(n=Inf)
+#inds[c(1,7,34),"name"]
+#vars[vars$concept%in%c("TOTAL POPULATION","RACE","RACE FOR THE POPULATION 18 YEARS AND OVER","SEX BY AGE"),]%>%print(n=Inf)
+
+#Download tract level data from decennial
+#Critical to capture all individuals identifying as black, not just black alone.
+tracts<-get_decennial(geography = "tract", variables = c(
+  "P001001", #Total Population
+  "P010001", #Total Population 18 years and over
+  "P010004", #Black alone 18yrs+
+  "P010011","P010016","P010017","P010018","P010019", #Two races B+...
+  "P010027","P010028","P010029","P010030","P010038","P010039","P010040","P010041","P010042",#Three races B+...
+  "P010048","P010049","P010050","P010051","P010052","P010053","P010058","P010059","P010060","P010061",#Four races B+...
+  "P010064","P010065","P010066","P010067","P010069","P010071",#Five and six races B+...
+  "P002002", #Total Urban Population
+  "P006003", #Total Races Tallied Black alone or in combination
+  "P012020","P012021","P012022","P012023","P012024","P012025", #Males 65 and older
+  "P012044","P012045","P012046","P012047","P012048","P012049"),#Females 65 and older
+                state = "PA",geometry = TRUE)
+#convert from long to wide format
+tracts<-spread(tracts, key="variable", value="value", fill = NA, convert = FALSE)
+
+age<-tracts[,c("P012020","P012021","P012022","P012023","P012024","P012025","P012044","P012045","P012046","P012047","P012048","P012049")]
+age$geometry<-NULL
+tracts$Pop65Plus<-rowSums(age)
+
+black18<-tracts[,c("P010004", #Black alone 18yrs+
+  "P010011","P010016","P010017","P010018","P010019", #Two races B+...
+  "P010027","P010028","P010029","P010030","P010038","P010039","P010040","P010041","P010042",#Three races B+...
+  "P010048","P010049","P010050","P010051","P010052","P010053","P010058","P010059","P010060","P010061",#Four races B+...
+  "P010064","P010065","P010066","P010067","P010069","P010071")]
+black18$geometry<-NULL
+tracts$POP18BLACK<-rowSums(black18)
+
+tracts<-tracts[,colnames(tracts)%in%c("P012020","P012021","P012022","P012023","P012024","P012025","P012044","P012045","P012046","P012047","P012048","P012049","P010004", "P010011","P010016","P010017","P010018","P010019","P010027","P010028","P010029","P010030","P010038","P010039","P010040","P010041","P010042",#Three races B+...
+  "P010048","P010049","P010050","P010051","P010052","P010053","P010058","P010059","P010060","P010061","P010064","P010065","P010066","P010067","P010069","P010071")==FALSE]
+
+#Messing about with the location of the geometry variable--something that seems subject to change by Census
+tract_geom<-tracts$geometry
+tracts$geometry<-NULL
+colnames(tracts)<-c("GEOID","NAME","TOTALPOP","UrbanPop","Black","POP18PLUS","Pop65Plus","POP18BLACK")
+tracts$BVAP<-tracts$POP18BLACK/tracts$POP18PLUS
+tracts[is.na(tracts$BVAP),"BVAP"]<-0 #where population is zero BVAP should be zero not NA
+tracts<-st_sf(tracts,geometry=tract_geom)
+
+#Examine variables in ACS--again retained for convenience if other variables are of interest this is how you can find them
+#vars<-load_variables(year="2012",dataset = "acs5",cache=TRUE)
+#unique(vars$concept)
+#print(vars[vars$concept=="POVERTY STATUS IN THE PAST 12 MONTHS BY SEX BY AGE",c("name","label")],n=Inf)
+#print(vars[vars$concept=="HEALTH INSURANCE COVERAGE STATUS BY SEX BY AGE",c("name","label")],n=Inf)
+#print(vars[vars$concept=="EDUCATIONAL ATTAINMENT FOR THE POPULATION 25 YEARS AND OVER",c("name","label")],n=Inf)
+#print(vars[vars$concept=="HOUSEHOLD TYPE (INCLUDING LIVING ALONE) BY RELATIONSHIP",c("name","label")],n=Inf)
+
+#Some variables retained here from the larger project but not used in this chapter
+#Individuals for whom poverty is determined and count of those in poverty
+tracts2<-get_acs(geography = "tract", variables = c("B17001_001","B17001_002"),
+                state = "PA",geometry = FALSE)
+#convert from long to wide format and drop margin of error (hate doing that)
+tracts2$moe<-NULL
+tracts2<-spread(tracts2, key="variable", value="estimate", fill = NA, convert = FALSE)
+tracts2$NAME<-NULL
+colnames(tracts2)<-c("GEOID","PovDeterm","InPoverty")
+
+#Individuals for whom health insurance is determined and those with health insurance
+tracts3<-get_acs(geography = "tract", variables = c("B27001_001","B27001_004","B27001_007","B27001_010","B27001_013","B27001_016","B27001_019","B27001_022","B27001_025","B27001_028","B27001_032","B27001_035","B27001_038","B27001_041","B27001_044","B27001_047","B27001_050","B27001_053","B27001_056"),
+                state = "PA",geometry = FALSE)
+#convert from long to wide format
+tracts3$moe<-NULL
+tracts3<-spread(tracts3, key="variable", value="estimate", fill = NA, convert = FALSE)
+tracts3$NAME<-NULL
+tracts3$HasHealthIns<-rowSums(tracts3[,c("B27001_004","B27001_007","B27001_010","B27001_013","B27001_016","B27001_019","B27001_022","B27001_025","B27001_028","B27001_032","B27001_035","B27001_038","B27001_041","B27001_044","B27001_047","B27001_050","B27001_053","B27001_056")])
+tracts3<-tracts3[,c("GEOID","B27001_001","HasHealthIns")]
+colnames(tracts3)<-c("GEOID","HealthInsD","HasHealthI")
+
+#Families with children
+tracts4<-get_acs(geography="tract", variables = c("B09019_002","B09019_008"),state="PA",geometry=FALSE)
+#B09019_002 Estimate!!Total!!In households
+#B09019_008 Estimate!!Total!!In households!!In family households!!Child
+tracts4$moe<-NULL
+tracts4<-spread(tracts4,key="variable",value="estimate",fill = NA,convert=FALSE)
+tracts4$NAME<-NULL
+colnames(tracts4)<-c("GEOID","Households","HHwithChild")
+
+#Share of employment in manufacturing
+tracts5<-get_acs(geography="tract",variables= c("C24030_001","C24030_007","C24030_034"),state="PA",geometry=FALSE)
+tracts5$moe<-NULL
+tracts5$NAME<-NULL
+tracts5<-spread(tracts5,key="variable",value="estimate",fill= NA,convert=FALSE)
+colnames(tracts5)<-c("GEOID","EmpTotal","EmpMale","EmpFemale")
+tracts5$EmpManufact<-tracts5$EmpMale+tracts5$EmpFemale
+tracts5<-tracts5[,c("GEOID","EmpTotal","EmpManufact")]
+
+
+head(tracts)
+tracts<-merge(tracts,tracts2,by="GEOID")
+tracts$NAME<-NULL
+tracts<-merge(tracts,tracts3,by="GEOID")
+tracts<-merge(tracts,tracts4,by="GEOID")
+tracts<-merge(tracts,tracts5,by="GEOID")
+
+#Chack for validity and remove or fix problem geometries
+tracts[is.na(st_dimension(tracts)),] #no geometry and zero pop. drop from data
+droplist<-tracts[is.na(st_dimension(tracts)),"GEOID"]
+tracts<-tracts[tracts$GEOID %in% droplist ==FALSE,]
+tracts$TOTALPOP<-as.integer(pull(tracts,TOTALPOP)) #convert to an integer as required for graph formation
+tracts$POP18PLUS<-as.integer(pull(tracts,POP18PLUS)) #convert to an integer as required for graph formation
+tracts$POP18BLACK<-as.integer(pull(tracts,POP18BLACK)) #convert to an integer as required for graph formation
+
+#Project to PA State Plane North units = feet
+tracts<-st_transform(tracts,crs = "+proj=lcc +lat_1=40.88333333333333 +lat_2=41.95 +lat_0=40.16666666666666 +lon_0=-77.75 +x_0=600000.0000000001 +y_0=0 +datum=NAD83 +units=us-ft +no_defs")
+st_write(obj = tracts,"PA_Tracts",driver = "ESRI Shapefile",delete_layer = TRUE,)
+summary(tracts)
+rm(tract_geom,tracts2,tracts3,tracts4,tracts5,age,black18,droplist)
+}else{
+  tracts<-st_read(dsn="./PA_Tracts",layer = "PA_Tracts")
+head(tracts)
+}
+```
+The following section should open python and run GerryChain on the provided file above. This is not as completely replicable as I would like. The reticulate package for running python within R does not seem to work well with .Rmd files, so instead of just knitting the file and seeing the output, this file has to be stepped through manually. I am hoping for a patch to fix this, but haven't seen one yet. Alternatively, if I was better at python, I could probably move this into a python script and run python directly through the system call and then just read in the results as a csv file. This would allow me to change the python script to a function so I could assign the number of districts, input file, and customize the selection criteria. All of this is on a future 'to do' list but is not implemented at this time. 
+
+For replication here since only 18 district plans are necessary it should only be required that you change the totSteps above to some suitably high number (it is set at 10 for a test run now)
+
+```{python runGerryChain,echo=FALSE}
+#################################################################
+#Basic imports
+import os
+from functools import partial
+import json
+import pandas
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+from gerrychain import (
+    Election,
+    Graph,
+    MarkovChain,
+    Partition,
+    accept,
+    constraints,
+    updaters,
+)
+
+from gerrychain.metrics import efficiency_gap, mean_median
+from gerrychain.proposals import recom
+from gerrychain.updaters import cut_edges
+from gerrychain.tree import recursive_tree_part
+
+#Imported variables from R scripts above
+num_dist = int(r.numDist) #number of districts in the plan
+totSteps = int(r.totSteps) #number of steps for the Markov Chain. 10 is a good number for tests
+shpPath = r.shpPath
+jsonPath = r.jsonPath
+overwrite = r.overwrite
+###############################################################
+
+#If it does not already exist,
+#create the underlying graph object from the json provided here 
+df=gpd.read_file(shpPath) 
+
+if os.path.exists(jsonPath) is False or overwrite is True:
+    graph=Graph.from_geodataframe(df, reproject=False)
+    graph.add_data(df)
+    graph.to_json(jsonPath) #save to json for quick load later
+else:
+    graph = Graph.from_json(jsonPath) #quick load if we already have the graph and don't want to overwrite it
+
+##############################################################
+#This section defines functions that may be used as part of updaters, as constraints, or simply as ways of drawing information out of the chain after the fact.
+
+#Takes in a partition for which the variables 'bvap' and 'vap' are defined as updaters. 
+#Returns the BVAP by district sorted from highest to lowest 
+def bvap_call(part):
+    return sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    
+#This is the constraint employed for the selection of 18 district plans, two districts
+#with at least 37% bvap
+#Takes in a partition for which the variables 'bvap' and 'vap' are defined as updaters.
+def two_bvap_37(part):
+    pct_bvap= sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    if(pct_bvap[1]>.37):
+        return(True)
+    else:
+        return(False)
+
+#This is the constraint employed for the selection of 6 district plans, 1 district with at
+#least 25% bvap
+#Returns True if there are is one district exceeding 25% BVAP
+def one_bvap_25(part):
+    pct_bvap= sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    if(pct_bvap[0]>.25):
+        return(True)
+    else:
+        return(False)
+
+#Returns True if there are three districts exceeding 37% BVAP
+#not used in final version
+def three_bvap_37(part):
+    pct_bvap= sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    if(pct_bvap[2]>.37):
+        return(True)
+    else:
+        return(False)
+
+#Returns True if there are at least two districts where BVAP exceeds 25%
+#not used in final version
+def two_bvap_25(part):
+    pct_bvap= sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    if(pct_bvap[1]>.25):
+        return(True)
+    else:
+        return(False)
+        
+#Returns True if there is at least one district where BVAP exceeds 50%
+#not used in final version
+def one_bvap_50(part):
+    pct_bvap= sorted([part["bvap"][p] / part["vap"][p] for p in part.parts],reverse=True)
+    if(pct_bvap[0]>.5):
+        return(True)
+    else:
+        return(False)
+################################################################
+#Updaters define the actions taken during each chain step to track important characteristics of the plan
+
+updaters = {
+    "population": updaters.Tally("TOTALPOP", alias="population"),
+    "cut_edges": cut_edges,
+    "bvap": updaters.Tally("POP18BLACK",alias="bvap"),
+    "vap": updaters.Tally("POP18PLUS",alias="vap")
+}
+
+################################################################
+#Next, use state population and number of districts to set allowable population deviation between districts
+pop = 0
+for v in graph.nodes:
+    pop=pop+graph.nodes()[v]["TOTALPOP"]
+
+new_plan = recursive_tree_part(graph=graph, parts=range(num_dist), pop_target=pop/num_dist,pop_col="TOTALPOP",epsilon= .01,node_repeats=1)
+initial_partition = Partition(graph, new_plan, updaters)
+#gerrychain.constraints.within_percent_of_ideal_population(initial_partition,percent=.02)
+###############################################################
+#Now set how your walk will propose the next step. 
+proposal = partial(recom, pop_col = "TOTALPOP", pop_target = pop/num_dist, epsilon = 0.05, node_repeats = 3)
+
+compactness_bound = constraints.UpperBound(
+    lambda p: len(p["cut_edges"]), 2 * len(initial_partition["cut_edges"])
+)
+
+##############################################################
+#Markov Chain
+
+chain = MarkovChain(
+    proposal=proposal,
+    constraints=[
+        constraints.within_percent_of_ideal_population(initial_partition, 0.05),
+        compactness_bound,
+        
+    ],
+    accept=accept.always_accept,
+    initial_state=initial_partition,
+    total_steps=totSteps,
+)
+
+#############################################################
+#Now that chain is defined, use the following functions to walk through it and save results
+#For this exercise we are identifying plans that meet certain desirable characteristics
+#We will save the plans that meet our criteria in a list called 'success'
+success=[]
+
+
+#Walking through our chain, save any plan that meets our criteria for success
+for step in chain:
+    if(num_dist == 6):
+        #criteria for 6 district plans
+        test_bvap=one_bvap_25(step)
+    else:
+        #criteria for 18 district plans
+        test_bvap=two_bvap_37(step)
+    if(test_bvap):
+        success.append(step)
+
+
+##############################################################
+#Take our output and put it into a data frame for porting back into R
+output=pandas.DataFrame(columns=list(df["GEOID"]))
+for i,step in enumerate(success):
+    output.loc[i] = pandas.Series()
+    for part in step.parts:
+        district_num = part
+        vertices = step.parts[part]
+        geoids = [graph.nodes[vertex]["GEOID"] for vertex in vertices]
+        for geoid in geoids:
+            output.iloc[i][geoid]=district_num
+#Transform so GEOID's are in columns and district assignments are in columns
+output=output.T
+```
+Take the output of the python work and process results back in R. This portion is set up with the assumption that the above code will be run multiple times to generate many valid plans for different numbers of districts. Subsequent code below will read in all files created by these plans for analysis. After running through the above script for 6 districts, run the section below. Then change parameters, re-run python and run this a second time.
+```{r processOutput, echo=FALSE}
+result<-py$output
+result<-data.frame(apply(X = result,MARGIN = 2,FUN = function(x) unlist(x)))
+colnames(result)<-paste0("Run_",1:length(colnames(result)))
+result<-result+1 #gerrychain starts district numbers from 0 not 1
+result$GEOID<-rownames(result)
+now<-format(Sys.time(), "%Y-%m-%d_%H-%M_")
+save(result,file=paste0("./Output Data/result",now,numDist," districts"))
+```
+Next section will processes the valid plans stored in the file produced above. Our analysis focuses on the ability of these valid plans to produce heterogeneous districts--for our purposes here we will seek districts for which the population composition on a given criteria closely approximates the statewide composition on that criteria. Other possibilities exist, for example using a formal measure of diversity, but it is not possible to improve the overall level of diversity beyond the state level, so it provides a simple metric for judging in this case.
+```{r set up judgement criteria}
+if(!file.exists("./Output Data/om18") | overwrite==TRUE){
+  tracts<-st_read("./PA_Tracts/PA_Tracts.shp",stringsAsFactors=FALSE)
+  colnames(tracts)<-c("GEOID","TOTALPOP","UrbanPop","Black","Pop18Plus","Pop65Plus","Pop18Black","BVAP","PovDeterm","InPoverty","HealthInsD","HasHealthI","Households","HHwChild","EmployedTot","EmpManufac","geometry")
+#Population of the State. Will serve as a denominator for the measures below
+  TotalPop<-sum(tracts$TOTALPOP)
+#These are the targets we will be working to hit
+  PctBlack<-sum(tracts$Black)/TotalPop #Statewide average black population
+  PctUrban<-sum(tracts$UrbanPop,na.rm=TRUE)/TotalPop #Statewide average urban population #note this is the Census definition calculated at the tract level. It has a very inclusive definition that significantly increases the urban population of PA beyond what many might consider its 'true' level as it includes people living in incorporated places as small as 2500. There are a high number of such places in PA and so most of the population is 'urban' even when it is located in areas that are distant from the economic and population concentrations that most would associate with that term.
+  PctPoverty<-sum(tracts$InPoverty,na.rm=TRUE)/sum(tracts$PovDeterm,na.rm=TRUE) #Percent of the population living below the Federal poverty threshold 
+  Pct65Plus<-sum(tracts$Pop65Plus,na.rm=TRUE)/TotalPop  #Percent of the population over 65
+  PctHasHealthIns<-sum(tracts$HasHealthI,na.rm=TRUE)/sum(tracts$HealthInsD,na.rm=TRUE) #Percent of the population reporting access to health insurance either through public or private means.
+  PctHHwChild<-sum(tracts$HHwChild)/sum(tracts$Households) #Share of households with child present
+  PctManufacturing<-sum(tracts$EmpManufac)/sum(tracts$EmployedTot) #Share of employed persons in Manufacturing industry
+
+#Load full set of simulation results
+  files<-list.files(path="./Output Data",full.names = TRUE)
+  files18<-files[str_detect(pattern="18 districts",string=files)]
+
+  load(files18[1])
+  result18<-result
+  if(length(files18)>1){
+    for(i in 2:length(files18)){
+      load(files18[i])
+      result18<-merge(result18,result,by="GEOID",sort = FALSE)
+    }
+  }
+  rm(result) #not necessary, but don't want to use it by accident
+
+#insure that these match
+  tracts<-tracts[order(tracts$GEOID),]
+  result18<-result18[order(result18$GEOID),]
+  identical(tracts$GEOID,result18$GEOID)
+
+#see how each district in result fares on these metrics
+#metrics
+  metrics<-c("PctBlack","PctUrban","PctPoverty","Pct65Plus","PctHasHealthIns","PctHHwChild","PctManufacturing")
+  metric_vals<-c(PctBlack,PctUrban,PctPoverty,Pct65Plus,PctHasHealthIns,PctHHwChild,PctManufacturing)
+  output_metrics_18<-generate_metrics(metrics = metrics, metric_vals = metric_vals,result = result18,numDist=18,tracts=tracts)
+  save(output_metrics_18,file="./Output Data/om18")
+}else{
+  load("./Output Data/om18")
+}
+```
+In this next section we analyze the results of our metrics for assessing plan quality. 
+Plan quality based on its replication of statewide percentages for PctUrban, PctPoverty,Pct65Plus, and PctHasHealthIns.
+```{r results}
+#1.
+#Look at results for the best plans:
+#
+#Focus on a subset of indicators
+sub_met<-c("Pct65Plus","PctManufacturing","PctBlack")
+use<-which(metrics%in%sub_met)
+sub_vals<-metric_vals[use]
+
+#Visualize choice in context of all plans
+distribs_18<-melt(data = output_metrics_18,id.vars = "Plan",measure.vars = c("Pct65Plus","PctManufacturing","PctBlack"),variable.name = "Metric",value.name = "DistrictSquaredError")
+distribs_18[,"MetricType"]<-factor(distribs_18$L1,levels=c(1,2),labels=c("Mean","Max"))
+distribs_18<-distribs_18[colnames(distribs_18 !="L1")]
+
+#Set up data for plotting
+pal<-brewer.pal(n = 6,name = "BrBG")
+pal<-pal[c(1,6)]
+variable_names<-c(
+      "PctBlack" = "Percent of Population that is Black",
+      "Pct65Plus" ="Percent of Population over 65",
+      "PctManufacturing"="Percent of Workforce in Manufacturing")
+numPlans<-length(unique(distribs_18$Plan))
+
+ggdensity(data =distribs_18, x = "DistrictSquaredError",
+            y="..scaled..",
+            fill="MetricType",
+            title = paste0("Mean and Maximum distance of districts from Commonwealth averages"),
+            subtitle = paste0("For ",numPlans," randomly generated plans containing at least two districts with >37% BVAP"))+
+  facet_wrap(~Metric,ncol=1,scales="free_y",labeller=labeller(Metric=variable_names))+
+  theme_pubclean()+
+  theme(legend.position="bottom",
+         text = element_text(color = "#22211d",size = 13))+
+  xlab("Difference from commonwealth percentage")+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1))+
+  ylab("Scaled density")+scale_y_discrete(breaks=c(0,.5,1),limits=c(0,1))+
+  scale_fill_brewer(name ="Metric Type",palette = "Accent")
+
+max(distribs_18[distribs_18$Metric=="PctBlack"& distribs_18$MetricType=="Max","DistrictSquaredError"])
+```
