@@ -37,10 +37,10 @@ shpPath<-paste0(getwd(),"/PA_Tracts/PA_Tracts.shp")
 jsonPath<-paste0(getwd(),"/PA_Tracts/PA_Tracts.json")
 
 numDist = 18  #how many districts should be in the plan
-totSteps = 10 #number of steps in the gerry chain. 10 is ideal for testing 10k-30k for full eval
+totSteps = 25000 #number of steps in the gerry chain. 10 is ideal for testing 10k-30k for full eval
 
-#py_discover_config() #identify the available conda environments
-use_condaenv(condaenv='gerry', required = TRUE) #this is set up based on the instructions for installing gerryChain using conda. See online docs for gerryChain
+py_discover_config() #identify the available conda environments
+use_condaenv(condaenv='r-reticulate', required = TRUE) #this is set up based on the instructions for installing gerryChain using conda. See online docs for gerryChain
 
 #Special R functions
 #Custom function to return MSD on the metrics we have for a *single* district's data
@@ -224,6 +224,7 @@ rm(tract_geom,tracts2,tracts3,tracts4,tracts5,age,black18,droplist)
   tracts<-st_read(dsn="./PA_Tracts",layer = "PA_Tracts")
 head(tracts)
 }
+
 ```
 The following section should open python and run GerryChain on the provided file above. This is not as completely replicable as I would like. The reticulate package for running python within R does not seem to work well with .Rmd files, so instead of just knitting the file and seeing the output, this file has to be stepped through manually. I am hoping for a patch to fix this, but haven't seen one yet. Alternatively, if I was better at python, I could probably move this into a python script and run python directly through the system call and then just read in the results as a csv file. This would allow me to change the python script to a function so I could assign the number of districts, input file, and customize the selection criteria. All of this is on a future 'to do' list but is not implemented at this time. 
 
@@ -331,24 +332,24 @@ def one_bvap_50(part):
 #Updaters define the actions taken during each chain step to track important characteristics of the plan
 
 updaters = {
-    "population": updaters.Tally("TOTALPOP", alias="population"),
+    "population": updaters.Tally("TOTALPO", alias="population"),
     "cut_edges": cut_edges,
-    "bvap": updaters.Tally("POP18BLACK",alias="bvap"),
-    "vap": updaters.Tally("POP18PLUS",alias="vap")
+    "bvap": updaters.Tally("POP18BL",alias="bvap"),
+    "vap": updaters.Tally("POP18PL",alias="vap")
 }
 
 ################################################################
 #Next, use state population and number of districts to set allowable population deviation between districts
 pop = 0
 for v in graph.nodes:
-    pop=pop+graph.nodes()[v]["TOTALPOP"]
+    pop=pop+graph.nodes()[v]["TOTALPO"]
 
-new_plan = recursive_tree_part(graph=graph, parts=range(num_dist), pop_target=pop/num_dist,pop_col="TOTALPOP",epsilon= .01,node_repeats=1)
+new_plan = recursive_tree_part(graph=graph, parts=range(num_dist), pop_target=pop/num_dist,pop_col="TOTALPO",epsilon= .01,node_repeats=1)
 initial_partition = Partition(graph, new_plan, updaters)
 #gerrychain.constraints.within_percent_of_ideal_population(initial_partition,percent=.02)
 ###############################################################
 #Now set how your walk will propose the next step. 
-proposal = partial(recom, pop_col = "TOTALPOP", pop_target = pop/num_dist, epsilon = 0.05, node_repeats = 3)
+proposal = partial(recom, pop_col = "TOTALPO", pop_target = pop/num_dist, epsilon = 0.05, node_repeats = 3)
 
 compactness_bound = constraints.UpperBound(
     lambda p: len(p["cut_edges"]), 2 * len(initial_partition["cut_edges"])
@@ -378,13 +379,13 @@ success=[]
 
 #Walking through our chain, save any plan that meets our criteria for success
 for step in chain:
-    if(num_dist == 6):
+ #   if(num_dist == 6):
         #criteria for 6 district plans
-        test_bvap=one_bvap_25(step)
-    else:
+ #       test_bvap=one_bvap_25(step)
+  #  else:
         #criteria for 18 district plans
-        test_bvap=two_bvap_37(step)
-    if(test_bvap):
+  #      test_bvap=two_bvap_37(step)
+ #   if(test_bvap):
         success.append(step)
 
 
@@ -486,12 +487,12 @@ ggdensity(data =distribs_18, x = "DistrictSquaredError",
             y="..scaled..",
             fill="MetricType",
             title = paste0("Mean and Maximum distance of districts from Commonwealth averages"),
-            subtitle = paste0("For ",numPlans," randomly generated plans containing at least two districts with >37% BVAP"))+
+            caption ="For 25,000 randomly generated plans.\nSource: 2010 Census tract boundaries, 2010 decennial and 2008-2012 ACS 5 year data ")+
   facet_wrap(~Metric,ncol=1,scales="free_y",labeller=labeller(Metric=variable_names))+
   theme_pubclean()+
   theme(legend.position="bottom",
          text = element_text(color = "#22211d",size = 13))+
-  xlab("Difference from commonwealth percentage")+
+  xlab("Difference from Commonwealth Population Composition")+
   scale_x_continuous(labels = scales::percent_format(accuracy = 1))+
   ylab("Scaled density")+scale_y_discrete(breaks=c(0,.5,1),limits=c(0,1))+
   scale_fill_brewer(name ="Metric Type",palette = "Accent")
